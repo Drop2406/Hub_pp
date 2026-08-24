@@ -1,0 +1,16 @@
+# ESP-IDF build output
+build/
+
+# ESP-IDF generated dependency components
+managed_components/
+
+# Temporary sdkconfig backup
+sdkconfig.old
+
+# Editor files
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+Desktop.ini
