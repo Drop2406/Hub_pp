@@ -16,9 +16,18 @@
 #include "sd_card.h"
 #include "ssd1351.h"
 #include "audio_output.h"
+#include "microphone.h"
+
+#include <stdlib.h>
+
+#include "model_path.h"
+#include "esp_afe_config.h"
+#include "esp_afe_sr_iface.h"
+#include "esp_afe_sr_models.h"
 
 #define JPEG_BUFFER_CAPACITY (64U * 1024U)
 #define RGB565_BUFFER_COUNT  2U
+#define MIC_TEST_SAMPLES 512U
 
 static const char *TAG = "MAIN";
 
@@ -200,10 +209,10 @@ static esp_err_t play_avi(
          */
         if (chunk_type == AVI_CHUNK_AUDIO) {
 
-            error = audio_output_write_pcm_mono16(
-                jpeg_buffer,
-                chunk_size
-            );
+            error = audio_output_enqueue_pcm_mono16(
+                    jpeg_buffer,
+                    chunk_size
+                );
 
             if (error != ESP_OK) {
 
@@ -388,188 +397,460 @@ static esp_err_t play_avi(
         : error;
 }
 
+static const esp_afe_sr_iface_t *s_afe_handle = NULL;
+static esp_afe_sr_data_t *s_afe_data = NULL;
+static srmodel_list_t *s_sr_models = NULL;
+
+
+static void wakenet_feed_task(void *arg)
+{
+    (void)arg;
+
+    const int feed_samples =
+        s_afe_handle->get_feed_chunksize(s_afe_data);
+
+    const int feed_channels =
+        s_afe_handle->get_feed_channel_num(s_afe_data);
+
+    ESP_LOGI(TAG,
+             "AFE feed: samples=%d channels=%d",
+             feed_samples,
+             feed_channels);
+
+    /*
+     * Ta khai báo AFE input là "M":
+     * một microphone duy nhất.
+     */
+    if (feed_channels != 1) {
+        ESP_LOGE(TAG,
+                 "Unexpected AFE channel count: %d",
+                 feed_channels);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int16_t *audio_buffer =
+        malloc((size_t)feed_samples * sizeof(int16_t));
+
+    if (audio_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate AFE feed buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (1) {
+        size_t samples_read = 0U;
+
+        esp_err_t error =
+            microphone_read(
+                audio_buffer,
+                (size_t)feed_samples,
+                &samples_read
+            );
+
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "Microphone read failed: %s",
+                     esp_err_to_name(error));
+            continue;
+        }
+
+        if (samples_read != (size_t)feed_samples) {
+            ESP_LOGW(TAG,
+                     "Short microphone read: %u/%d",
+                     (unsigned int)samples_read,
+                     feed_samples);
+            continue;
+        }
+
+        int result =
+            s_afe_handle->feed(
+                s_afe_data,
+                audio_buffer
+            );
+
+        if (result < 0) {
+            ESP_LOGW(TAG, "AFE feed failed: %d", result);
+        }
+    }
+}
+
+
+static void wakenet_fetch_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "WakeNet detector started");
+    ESP_LOGI(TAG, "Say: Hi ESP");
+
+    while (1) {
+        afe_fetch_result_t *result =
+            s_afe_handle->fetch(s_afe_data);
+
+        if (result == NULL) {
+            ESP_LOGE(TAG, "AFE fetch returned NULL");
+            continue;
+        }
+
+        if (result->ret_value == ESP_FAIL) {
+            ESP_LOGE(TAG, "AFE fetch failed");
+            continue;
+        }
+
+        if (result->wakeup_state == WAKENET_DETECTED) {
+            ESP_LOGI(TAG, "============================");
+            ESP_LOGI(TAG, "WAKE WORD DETECTED!");
+            ESP_LOGI(TAG,
+                     "model=%d word=%d volume=%.1f dB",
+                     result->wakenet_model_index,
+                     result->wake_word_index,
+                     result->data_volume);
+            ESP_LOGI(TAG, "============================");
+        }
+    }
+}
 
 void app_main(void)
 {
-    ESP_LOGI(
-        TAG,
-        "Starting multi-AVI playback"
-    );
+    // ESP_LOGI(
+    //     TAG,
+    //     "Starting multi-AVI playback"
+    // );
 
-    /*
-     * 1. Khởi tạo SSD1351.
-     */
-    esp_err_t error =
-        ssd1351_init();
+    // /*
+    //  * 1. Khởi tạo SSD1351.
+    //  */
+    // esp_err_t error =
+    //     ssd1351_init();
 
-    if (error != ESP_OK) {
+    // if (error != ESP_OK) {
 
-        ESP_LOGE(
-            TAG,
-            "SSD1351 init failed: %s",
-            esp_err_to_name(error)
-        );
+    //     ESP_LOGE(
+    //         TAG,
+    //         "SSD1351 init failed: %s",
+    //         esp_err_to_name(error)
+    //     );
 
-        return;
-    }
+    //     return;
+    // }
 
-    /*
-     * 2. Cấp phát 2 DMA framebuffer.
-     */
-    error =
-        allocate_dma_framebuffers();
+    // /*
+    //  * 2. Cấp phát 2 DMA framebuffer.
+    //  */
+    // error =
+    //     allocate_dma_framebuffers();
 
-    if (error != ESP_OK) {
-        return;
-    }
+    // if (error != ESP_OK) {
+    //     return;
+    // }
 
-    /*
-     * 3. Khởi tạo I2S cho MAX98357A.
-     */
-    error =
-        audio_output_init();
+    // /*
+    //  * 3. Khởi tạo I2S cho MAX98357A.
+    //  */
+    // error =
+    //     audio_output_init();
 
-    if (error != ESP_OK) {
+    // if (error != ESP_OK) {
 
-        ESP_LOGE(
-            TAG,
-            "Audio init failed: %s",
-            esp_err_to_name(error)
-        );
+    //     ESP_LOGE(
+    //         TAG,
+    //         "Audio init failed: %s",
+    //         esp_err_to_name(error)
+    //     );
 
-        return;
-    }
+    //     return;
+    // }
 
-    /*
-     * 4. Clear màn hình.
-     */
-    error = ssd1351_fill_screen(
-        SSD1351_RGB565(0, 0, 0)
-    );
+    // /*
+    //  * 4. Clear màn hình.
+    //  */
+    // error = ssd1351_fill_screen(
+    //     SSD1351_RGB565(0, 0, 0)
+    // );
 
-    if (error != ESP_OK) {
+    // if (error != ESP_OK) {
 
-        ESP_LOGE(
-            TAG,
-            "Cannot clear SSD1351: %s",
-            esp_err_to_name(error)
-        );
+    //     ESP_LOGE(
+    //         TAG,
+    //         "Cannot clear SSD1351: %s",
+    //         esp_err_to_name(error)
+    //     );
 
-        return;
-    }
+    //     return;
+    // }
 
-    /*
-     * 5. Mount SD.
-     */
-    error =
-        sd_card_mount();
+    // /*
+    //  * 5. Mount SD.
+    //  */
+    // error =
+    //     sd_card_mount();
 
-    if (error != ESP_OK) {
+    // if (error != ESP_OK) {
 
-        ESP_LOGE(
-            TAG,
-            "SD card initialization failed: %s",
-            esp_err_to_name(error)
-        );
+    //     ESP_LOGE(
+    //         TAG,
+    //         "SD card initialization failed: %s",
+    //         esp_err_to_name(error)
+    //     );
 
-        return;
-    }
+    //     return;
+    // }
 
-    /*
-     * 6. Danh sách video.
-     */
-    static const char *video_list[] = {
+    // /*
+    //  * 6. Danh sách video.
+    //  */
+    // static const char *video_list[] = {
 
-        SD_CARD_MOUNT_POINT
-        "/ANIM/1HELLO~1.AVI",
+    //     SD_CARD_MOUNT_POINT
+    //     "/ANIM/1HELLO~1.AVI",
 
-        SD_CARD_MOUNT_POINT
-        "/ANIM/25SUPR~1.AVI",
+    //     SD_CARD_MOUNT_POINT
+    //     "/ANIM/25SUPR~1.AVI",
 
-        SD_CARD_MOUNT_POINT
-        "/ANIM/3ANGRY~1.AVI",
-    };
+    //     SD_CARD_MOUNT_POINT
+    //     "/ANIM/3ANGRY~1.AVI",
 
-    const size_t video_count =
-        sizeof(video_list) /
-        sizeof(video_list[0]);
+    //     SD_CARD_MOUNT_POINT
+    //     "/ANIM/8SLEEP~1.AVI",
 
+    //     SD_CARD_MOUNT_POINT
+    //     "/ANIM/22JOYF~1.AVI",
 
-    uint32_t frame_interval_us = 0U;
+    //     SD_CARD_MOUNT_POINT
+    //     "/ANIM/5CURIO~1.AVI",
+    // };
 
-
-    error = avi_get_frame_interval(
-        video_list[0],
-        &frame_interval_us
-    );
-
-
-    if (
-        error == ESP_OK &&
-        frame_interval_us > 0U
-    ) {
-
-        float source_fps =
-            1000000.0f /
-            (float)frame_interval_us;
+    // const size_t video_count =
+    //     sizeof(video_list) /
+    //     sizeof(video_list[0]);
 
 
-        ESP_LOGI(
-            TAG,
-            "AVI frame interval: %u us",
-            (unsigned int)frame_interval_us
-        );
+    // uint32_t frame_interval_us = 0U;
 
 
-        ESP_LOGI(
-            TAG,
-            "AVI source FPS: %.2f",
-            source_fps
-        );
-    }
-    /*
-     * 7. Phát lần lượt các video.
-     */
-    for (
-        size_t video_index = 0;
-        video_index < video_count;
-        video_index++
-    ) {
+    // error = avi_get_frame_interval(
+    //     video_list[0],
+    //     &frame_interval_us
+    // );
 
-        ESP_LOGI(
-            TAG,
-            "Starting video %u / %u",
-            (unsigned int)(video_index + 1U),
-            (unsigned int)video_count
-        );
 
-        error = play_avi(
-            video_list[video_index]
-        );
+    // if (
+    //     error == ESP_OK &&
+    //     frame_interval_us > 0U
+    // ) {
 
-        if (error != ESP_OK) {
+    //     float source_fps =
+    //         1000000.0f /
+    //         (float)frame_interval_us;
 
-            ESP_LOGE(
-                TAG,
-                "Video %u failed: %s",
-                (unsigned int)(video_index + 1U),
-                esp_err_to_name(error)
-            );
 
-            /*
-             * Nếu video này lỗi thì vẫn thử video kế tiếp.
-             */
-        }
-    }
+    //     ESP_LOGI(
+    //         TAG,
+    //         "AVI frame interval: %u us",
+    //         (unsigned int)frame_interval_us
+    //     );
 
-    ESP_LOGI(
-        TAG,
-        "All videos completed"
-    );
+
+    //     ESP_LOGI(
+    //         TAG,
+    //         "AVI source FPS: %.2f",
+    //         source_fps
+    //     );
+    // }
+    // /*
+    //  * 7. Phát lần lượt các video.
+    //  */
+    // for (
+    //     size_t video_index = 0;
+    //     video_index < video_count;
+    //     video_index++
+    // ) {
+
+    //     ESP_LOGI(
+    //         TAG,
+    //         "Starting video %u / %u",
+    //         (unsigned int)(video_index + 1U),
+    //         (unsigned int)video_count
+    //     );
+
+    //     error = play_avi(
+    //         video_list[video_index]
+    //     );
+
+    //     if (error != ESP_OK) {
+
+    //         ESP_LOGE(
+    //             TAG,
+    //             "Video %u failed: %s",
+    //             (unsigned int)(video_index + 1U),
+    //             esp_err_to_name(error)
+    //         );
+
+    //         /*
+    //          * Nếu video này lỗi thì vẫn thử video kế tiếp.
+    //          */
+    //     }
+    // }
+
+    // ESP_LOGI(
+    //     TAG,
+    //     "All videos completed"
+    // );
 
     /*
      * 8. Giữ frame cuối cùng.
      */
+
+    ESP_LOGI(TAG, "============================");
+    ESP_LOGI(TAG, "ESP-SR WakeNet test");
+    ESP_LOGI(TAG, "============================");
+
+    /*
+     * 1. Khởi tạo INMP441.
+     */
+    ESP_ERROR_CHECK(microphone_init());
+
+    /*
+     * 2. Load model từ partition có label "model".
+     */
+    s_sr_models = esp_srmodel_init("model");
+
+    if (s_sr_models == NULL) {
+        ESP_LOGE(TAG, "Failed to load ESP-SR models");
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "Models loaded: %d",
+             s_sr_models->num);
+
+    for (int i = 0; i < s_sr_models->num; i++) {
+        ESP_LOGI(TAG,
+                 "Model[%d]: %s",
+                 i,
+                 s_sr_models->model_name[i]);
+    }
+
+    /*
+     * "M" = một microphone channel.
+     *
+     * Không có R (playback reference) vì bài test
+     * này chưa sử dụng speaker/AEC.
+     */
+    afe_config_t *afe_config =
+        afe_config_init(
+            "M",
+            s_sr_models,
+            AFE_TYPE_SR,
+            AFE_MODE_HIGH_PERF
+        );
+
+    if (afe_config == NULL) {
+        ESP_LOGE(TAG, "afe_config_init failed");
+        return;
+    }
+
+    /*
+     * Không có playback-reference channel,
+     * nên không dùng echo cancellation.
+     */
+    afe_config->aec_init = false;
+
+    if (!afe_config->wakenet_init) {
+        ESP_LOGE(TAG, "WakeNet is not enabled");
+        afe_config_free(afe_config);
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "WakeNet model: %s",
+             afe_config->wakenet_model_name != NULL
+                 ? afe_config->wakenet_model_name
+                 : "(null)");
+
+    /*
+     * 3. Tạo AFE interface.
+     */
+    s_afe_handle =
+        esp_afe_handle_from_config(afe_config);
+
+    if (s_afe_handle == NULL) {
+        ESP_LOGE(TAG, "Failed to get AFE handle");
+        afe_config_free(afe_config);
+        return;
+    }
+
+    /*
+     * 4. Tạo AFE runtime instance.
+     */
+    s_afe_data =
+        s_afe_handle->create_from_config(afe_config);
+
+    if (s_afe_data == NULL) {
+        ESP_LOGE(TAG, "Failed to create AFE");
+        afe_config_free(afe_config);
+        return;
+    }
+
+    afe_config_free(afe_config);
+
+    /*
+     * In pipeline để debug.
+     */
+    s_afe_handle->print_pipeline(s_afe_data);
+
+    ESP_LOGI(
+        TAG,
+        "AFE sample rate: %d Hz",
+        s_afe_handle->get_samp_rate(s_afe_data)
+    );
+
+    ESP_LOGI(
+        TAG,
+        "AFE feed chunk: %d samples",
+        s_afe_handle->get_feed_chunksize(s_afe_data)
+    );
+
+    /*
+     * feed task:
+     * INMP441 -> AFE
+     */
+    BaseType_t task_result =
+        xTaskCreate(
+            wakenet_feed_task,
+            "wakenet_feed",
+            6 * 1024,
+            NULL,
+            5,
+            NULL
+        );
+
+    if (task_result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create feed task");
+        return;
+    }
+
+    /*
+     * fetch task:
+     * AFE -> WakeNet detection result
+     */
+    task_result =
+        xTaskCreate(
+            wakenet_fetch_task,
+            "wakenet_fetch",
+            6 * 1024,
+            NULL,
+            5,
+            NULL
+        );
+
+    if (task_result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create fetch task");
+        return;
+    }
+
+    ESP_LOGI(TAG, "WakeNet is ready");
+
     while (1) {
 
         vTaskDelay(

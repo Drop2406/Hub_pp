@@ -6,6 +6,5 @@ idf_component_register(
         "avi_reader.c"
         "image_decoder.c"
         "audio_output.c"
-    INCLUDE_DIRS
-        "."
+    INCLUDE_DIRS "."
 )
