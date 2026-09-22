@@ -5,9 +5,7 @@
 
 #include "esp_err.h"
 
-
 #define MICROPHONE_SAMPLE_RATE 16000U
-
 
 esp_err_t microphone_init(void);
 

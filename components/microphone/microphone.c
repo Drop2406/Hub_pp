@@ -9,19 +9,15 @@
 
 #include "esp_log.h"
 
-
 #define MICROPHONE_BCLK_GPIO   GPIO_NUM_15
 #define MICROPHONE_WS_GPIO     GPIO_NUM_16
 #define MICROPHONE_DATA_GPIO   GPIO_NUM_17
 
-
 #define MICROPHONE_RAW_BUFFER_SAMPLES 256U
-
 
 static const char *TAG = "MICROPHONE";
 
 static i2s_chan_handle_t microphone_rx_channel = NULL;
-
 
 /*
  * Buffer nhận raw data từ I2S.
@@ -32,13 +28,11 @@ static i2s_chan_handle_t microphone_rx_channel = NULL;
  */
 static int32_t raw_buffer[MICROPHONE_RAW_BUFFER_SAMPLES];
 
-
 esp_err_t microphone_init(void)
 {
     if (microphone_rx_channel != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-
 
     /*
      * Tạo I2S RX channel.
