@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <inttypes.h>
@@ -27,7 +28,8 @@
 
 #define JPEG_BUFFER_CAPACITY (64U * 1024U)
 #define RGB565_BUFFER_COUNT  2U
-#define MIC_TEST_SAMPLES 512U
+#define HELLO_AVI_PATH SD_CARD_MOUNT_POINT "/ANIM/1HELLO~1.AVI"
+#define HELLO_RETRIGGER_GUARD_MS 1500U
 
 static const char *TAG = "MAIN";
 
@@ -397,10 +399,43 @@ static esp_err_t play_avi(
         : error;
 }
 
+/*
+ * WakeNet chỉ gửi thông báo; task riêng sẽ phát AVI.
+ * Tránh chặn AFE fetch trong lúc đọc SD, giải mã JPEG và truyền SPI.
+ */
+static TaskHandle_t s_hello_task_handle = NULL;
+static atomic_bool s_hello_busy = ATOMIC_VAR_INIT(false);
+
+static void hello_video_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        /* Đợi sự kiện đánh thức từ wakenet_fetch_task. */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        ESP_LOGI(TAG, "Wake word -> play Hello AVI");
+
+        esp_err_t error = play_avi(HELLO_AVI_PATH);
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "Hello AVI failed: %s", esp_err_to_name(error));
+        }
+
+        /*
+         * Audio output có Stream Buffer chạy bất đồng bộ: một ít âm thanh
+         * có thể còn đang phát sau khi play_avi() trả về.
+         * Đây là khoảng chờ thử nghiệm, chưa phải cơ chế chờ loa phát hết.
+         */
+        vTaskDelay(pdMS_TO_TICKS(HELLO_RETRIGGER_GUARD_MS));
+
+        atomic_store(&s_hello_busy, false);
+        ESP_LOGI(TAG, "Ready for next wake word");
+    }
+}
+
 static const esp_afe_sr_iface_t *s_afe_handle = NULL;
 static esp_afe_sr_data_t *s_afe_data = NULL;
 static srmodel_list_t *s_sr_models = NULL;
-
 
 static void wakenet_feed_task(void *arg)
 {
@@ -506,201 +541,45 @@ static void wakenet_fetch_task(void *arg)
                      result->wake_word_index,
                      result->data_volume);
             ESP_LOGI(TAG, "============================");
+
+            /* Chỉ phát 1 AVI tại một thời điểm; bỏ qua trigger khi đang phát. */
+            if (s_hello_task_handle != NULL &&
+                !atomic_exchange(&s_hello_busy, true)) {
+                xTaskNotifyGive(s_hello_task_handle);
+            }
         }
     }
 }
 
 void app_main(void)
 {
-    // ESP_LOGI(
-    //     TAG,
-    //     "Starting multi-AVI playback"
-    // );
+    /*
+     * 1. Khôi phục các thành phần của pipeline AVI đã kiểm tra trước đây.
+     * Không phát AVI tại boot: chỉ phát khi WakeNet báo phát hiện.
+     */
+    ESP_ERROR_CHECK(ssd1351_init());
+    ESP_ERROR_CHECK(allocate_dma_framebuffers());
+    ESP_ERROR_CHECK(audio_output_init());
+    ESP_ERROR_CHECK(ssd1351_fill_screen(SSD1351_RGB565(0, 0, 0)));
+    ESP_ERROR_CHECK(sd_card_mount());
 
-    // /*
-    //  * 1. Khởi tạo SSD1351.
-    //  */
-    // esp_err_t error =
-    //     ssd1351_init();
-
-    // if (error != ESP_OK) {
-
-    //     ESP_LOGE(
-    //         TAG,
-    //         "SSD1351 init failed: %s",
-    //         esp_err_to_name(error)
-    //     );
-
-    //     return;
-    // }
-
-    // /*
-    //  * 2. Cấp phát 2 DMA framebuffer.
-    //  */
-    // error =
-    //     allocate_dma_framebuffers();
-
-    // if (error != ESP_OK) {
-    //     return;
-    // }
-
-    // /*
-    //  * 3. Khởi tạo I2S cho MAX98357A.
-    //  */
-    // error =
-    //     audio_output_init();
-
-    // if (error != ESP_OK) {
-
-    //     ESP_LOGE(
-    //         TAG,
-    //         "Audio init failed: %s",
-    //         esp_err_to_name(error)
-    //     );
-
-    //     return;
-    // }
-
-    // /*
-    //  * 4. Clear màn hình.
-    //  */
-    // error = ssd1351_fill_screen(
-    //     SSD1351_RGB565(0, 0, 0)
-    // );
-
-    // if (error != ESP_OK) {
-
-    //     ESP_LOGE(
-    //         TAG,
-    //         "Cannot clear SSD1351: %s",
-    //         esp_err_to_name(error)
-    //     );
-
-    //     return;
-    // }
-
-    // /*
-    //  * 5. Mount SD.
-    //  */
-    // error =
-    //     sd_card_mount();
-
-    // if (error != ESP_OK) {
-
-    //     ESP_LOGE(
-    //         TAG,
-    //         "SD card initialization failed: %s",
-    //         esp_err_to_name(error)
-    //     );
-
-    //     return;
-    // }
-
-    // /*
-    //  * 6. Danh sách video.
-    //  */
-    // static const char *video_list[] = {
-
-    //     SD_CARD_MOUNT_POINT
-    //     "/ANIM/1HELLO~1.AVI",
-
-    //     SD_CARD_MOUNT_POINT
-    //     "/ANIM/25SUPR~1.AVI",
-
-    //     SD_CARD_MOUNT_POINT
-    //     "/ANIM/3ANGRY~1.AVI",
-
-    //     SD_CARD_MOUNT_POINT
-    //     "/ANIM/8SLEEP~1.AVI",
-
-    //     SD_CARD_MOUNT_POINT
-    //     "/ANIM/22JOYF~1.AVI",
-
-    //     SD_CARD_MOUNT_POINT
-    //     "/ANIM/5CURIO~1.AVI",
-    // };
-
-    // const size_t video_count =
-    //     sizeof(video_list) /
-    //     sizeof(video_list[0]);
-
-
-    // uint32_t frame_interval_us = 0U;
-
-
-    // error = avi_get_frame_interval(
-    //     video_list[0],
-    //     &frame_interval_us
-    // );
-
-
-    // if (
-    //     error == ESP_OK &&
-    //     frame_interval_us > 0U
-    // ) {
-
-    //     float source_fps =
-    //         1000000.0f /
-    //         (float)frame_interval_us;
-
-
-    //     ESP_LOGI(
-    //         TAG,
-    //         "AVI frame interval: %u us",
-    //         (unsigned int)frame_interval_us
-    //     );
-
-
-    //     ESP_LOGI(
-    //         TAG,
-    //         "AVI source FPS: %.2f",
-    //         source_fps
-    //     );
-    // }
-    // /*
-    //  * 7. Phát lần lượt các video.
-    //  */
-    // for (
-    //     size_t video_index = 0;
-    //     video_index < video_count;
-    //     video_index++
-    // ) {
-
-    //     ESP_LOGI(
-    //         TAG,
-    //         "Starting video %u / %u",
-    //         (unsigned int)(video_index + 1U),
-    //         (unsigned int)video_count
-    //     );
-
-    //     error = play_avi(
-    //         video_list[video_index]
-    //     );
-
-    //     if (error != ESP_OK) {
-
-    //         ESP_LOGE(
-    //             TAG,
-    //             "Video %u failed: %s",
-    //             (unsigned int)(video_index + 1U),
-    //             esp_err_to_name(error)
-    //         );
-
-    //         /*
-    //          * Nếu video này lỗi thì vẫn thử video kế tiếp.
-    //          */
-    //     }
-    // }
-
-    // ESP_LOGI(
-    //     TAG,
-    //     "All videos completed"
-    // );
+    /* Phát video trong task riêng, không chặn nhiệm vụ nhận diện. */
+    BaseType_t task_result = xTaskCreate(
+        hello_video_task,
+        "hello_video",
+        8 * 1024,
+        NULL,
+        4,
+        &s_hello_task_handle
+    );
+    if (task_result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Hello video task");
+        return;
+    }
 
     /*
-     * 8. Giữ frame cuối cùng.
+     * 2. Khởi động WakeNet như bản đã chạy thành công.
      */
-
     ESP_LOGI(TAG, "============================");
     ESP_LOGI(TAG, "ESP-SR WakeNet test");
     ESP_LOGI(TAG, "============================");
@@ -755,6 +634,9 @@ void app_main(void)
      * nên không dùng echo cancellation.
      */
     afe_config->aec_init = false;
+
+    /* Ưu tiên PSRAM cho AFE để dành internal/DMA RAM cho AVI và I2S. */
+    afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
     if (!afe_config->wakenet_init) {
         ESP_LOGE(TAG, "WakeNet is not enabled");
@@ -815,7 +697,7 @@ void app_main(void)
      * feed task:
      * INMP441 -> AFE
      */
-    BaseType_t task_result =
+    task_result =
         xTaskCreate(
             wakenet_feed_task,
             "wakenet_feed",
