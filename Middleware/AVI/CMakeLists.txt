@@ -1,5 +1,4 @@
 idf_component_register(
-    SRCS
-        "main.c"
+    SRCS "avi_reader.c"
     INCLUDE_DIRS "."
 )

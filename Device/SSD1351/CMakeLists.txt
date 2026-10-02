@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS
-        "main.c"
+    SRCS "ssd1351.c"
     INCLUDE_DIRS "."
+    REQUIRES driver
 )

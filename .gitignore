@@ -14,3 +14,5 @@ sdkconfig.old
 # Windows
 Thumbs.db
 Desktop.ini
+/sdkconfig 
+/sdkconfig.old 

@@ -1,0 +1,27 @@
+menu "WiFi STA Configuration"
+
+config WIFI_STA_CONNECT
+    bool "Enable WiFi station"
+    default y
+
+if WIFI_STA_CONNECT
+
+config WIFI_STA_SSID
+    string "WiFi SSID"
+    default "myssid"
+
+config WIFI_STA_PASSWORD
+    string "WiFi password"
+    default "mypassword"
+
+config WIFI_STA_IPV4
+    bool "Enable IPv4"
+    default y
+
+config WIFI_STA_AUTO_RECONNECT
+    bool "Auto reconnect"
+    default y
+
+endif
+
+endmenu
