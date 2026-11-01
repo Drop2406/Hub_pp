@@ -11,6 +11,8 @@
 typedef struct {
     FILE *file;
 
+    uint8_t *file_buffer;
+
     long movi_start;
     long movi_end;
 
@@ -113,4 +115,5 @@ esp_err_t avi_get_frame_interval(
     const char *file_path,
     uint32_t *microseconds_per_frame
 );
+
 #endif

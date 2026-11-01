@@ -7,18 +7,13 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 
 #define AVI_FILE_BUFFER_SIZE (32U * 1024U)
 
 
 static const char *TAG = "AVI_READER";
-
-/*
- * Chỉ dùng một AVI stream tại một thời điểm.
- * Buffer này không nằm trên stack.
- */
-static uint8_t avi_file_buffer[AVI_FILE_BUFFER_SIZE];
 
 
 static uint32_t read_u32_le(const uint8_t *data)
@@ -545,15 +540,44 @@ esp_err_t avi_stream_open(
     }
 
     /*
-     * setvbuf() phải được gọi trước thao tác đọc/seek đầu tiên
-     * trên stream vừa mở.
+     * Buffer này chỉ cần trong lifetime
+     * của AVI stream.
+     *
+     * Không cần DMA nên đặt ở PSRAM.
      */
-    int buffer_result = setvbuf(
-        stream->file,
-        (char *)avi_file_buffer,
-        _IOFBF,
-        sizeof(avi_file_buffer)
-    );
+    stream->file_buffer =
+        heap_caps_malloc(
+            AVI_FILE_BUFFER_SIZE,
+            MALLOC_CAP_SPIRAM |
+            MALLOC_CAP_8BIT
+        );
+
+    if (stream->file_buffer == NULL) {
+        ESP_LOGE(
+            TAG,
+            "Cannot allocate AVI file buffer in PSRAM"
+        );
+
+        fclose(stream->file);
+        stream->file = NULL;
+
+        return ESP_ERR_NO_MEM;
+    }
+
+    /*
+     * setvbuf() phải được gọi trước
+     * thao tác đọc/seek đầu tiên.
+     *
+     * file_buffer phải tồn tại cho tới
+     * khi fclose().
+     */
+    int buffer_result =
+        setvbuf(
+            stream->file,
+            (char *)stream->file_buffer,
+            _IOFBF,
+            AVI_FILE_BUFFER_SIZE
+        );
 
     if (buffer_result != 0) {
         ESP_LOGW(
@@ -563,25 +587,36 @@ esp_err_t avi_stream_open(
     } else {
         ESP_LOGI(
             TAG,
-            "AVI file buffer: %u bytes",
-            (unsigned int)sizeof(avi_file_buffer)
+            "AVI file buffer in PSRAM: %u bytes",
+            (unsigned int)AVI_FILE_BUFFER_SIZE
         );
     }
 
-    if (fseek(
+    if (
+        fseek(
             stream->file,
             movi_offset,
             SEEK_SET
-        ) != 0) {
+        ) != 0
+    ) {
         fclose(stream->file);
         stream->file = NULL;
+
+        heap_caps_free(
+            stream->file_buffer
+        );
+
+        stream->file_buffer = NULL;
 
         return ESP_FAIL;
     }
 
-    stream->movi_start = movi_offset;
+    stream->movi_start =
+        movi_offset;
+
     stream->movi_end =
-        movi_offset + (long)movi_size;
+        movi_offset +
+        (long)movi_size;
 
     stream->frame_index = 0U;
 
@@ -1058,7 +1093,7 @@ esp_err_t avi_stream_read_next_jpeg(
         bool is_audio_chunk =
             chunk_header[2] == 'w' &&
             chunk_header[3] == 'b';
-        
+
         // if (is_audio_chunk) {
         //     ESP_LOGI(
         //         TAG,
@@ -1207,9 +1242,25 @@ void avi_stream_close(
         return;
     }
 
+    /*
+     * FILE có thể vẫn đang dùng file_buffer,
+     * nên phải fclose() trước khi free().
+     */
     if (stream->file != NULL) {
         fclose(stream->file);
         stream->file = NULL;
+    }
+
+    /*
+     * Sau khi file đã đóng mới trả
+     * 32 KB PSRAM về heap.
+     */
+    if (stream->file_buffer != NULL) {
+        heap_caps_free(
+            stream->file_buffer
+        );
+
+        stream->file_buffer = NULL;
     }
 
     stream->movi_start = 0;
@@ -1888,11 +1939,10 @@ esp_err_t avi_get_audio_info(
 
             if (chunk_size & 1U) {
 
-                error =
-                    discard_exact(
-                        file,
-                        1U
-                    );
+                error = discard_exact(
+                    file,
+                    1U
+                );
 
                 if (error != ESP_OK) {
                     fclose(file);
