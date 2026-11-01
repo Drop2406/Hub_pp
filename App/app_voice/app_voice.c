@@ -5,19 +5,26 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "sdkconfig.h"
 
 #include "microphone.h"
 #include "sd_card.h"
 
 #include "app_media.h"
 #include "app_led.h"
+#include "voice_recorder.h"
+#include "groq_stt.h"
+#include "groq_chat.h"
 
 #include "model_path.h"
 #include "esp_afe_config.h"
@@ -39,6 +46,12 @@
 
 #define VOICE_TASK_STACK_BYTES (4U * 1024U)
 #define STACK_LOG_PERIOD_MS     5000U
+#define RECORD_DURATION_MS        5000U
+#define STT_TASK_STACK_BYTES      (8U * 1024U)
+#define STT_TASK_PRIORITY         5U
+#define STT_QUEUE_LENGTH          1U
+#define STT_TEXT_CAPACITY         512U
+#define CHAT_ANSWER_CAPACITY      512U
 
 
 static const char *TAG = "APP_VOICE";
@@ -63,6 +76,194 @@ static srmodel_list_t *s_sr_models = NULL;
 
 static esp_mn_iface_t *s_mn_handle = NULL;
 static model_iface_data_t *s_mn_data = NULL;
+
+
+typedef struct {
+    int16_t *samples;
+    size_t sample_count;
+    uint32_t sample_rate;
+} stt_job_t;
+
+
+static QueueHandle_t s_stt_queue = NULL;
+static bool s_stt_enabled = false;
+
+static void log_stack_high_water(
+    const char *task_name
+);
+
+
+static esp_err_t queue_recording_for_stt(
+    const voice_recording_t *recording
+)
+{
+    if (
+        !s_stt_enabled ||
+        s_stt_queue == NULL
+    ) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (
+        recording == NULL ||
+        recording->samples == NULL ||
+        recording->sample_count == 0U
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const size_t pcm_bytes =
+        recording->sample_count *
+        sizeof(int16_t);
+
+    int16_t *copy =
+        heap_caps_malloc(
+            pcm_bytes,
+            MALLOC_CAP_SPIRAM |
+            MALLOC_CAP_8BIT
+        );
+
+    if (copy == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    memcpy(
+        copy,
+        recording->samples,
+        pcm_bytes
+    );
+
+    stt_job_t job = {
+        .samples = copy,
+        .sample_count = recording->sample_count,
+        .sample_rate = recording->sample_rate,
+    };
+
+    if (
+        xQueueSend(
+            s_stt_queue,
+            &job,
+            0
+        ) != pdTRUE
+    ) {
+        heap_caps_free(copy);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "[STT] queued %u samples",
+        (unsigned int)job.sample_count
+    );
+
+    return ESP_OK;
+}
+
+
+static void stt_task(void *arg)
+{
+    (void)arg;
+
+    stt_job_t job;
+
+    while (1) {
+
+        if (
+            xQueueReceive(
+                s_stt_queue,
+                &job,
+                portMAX_DELAY
+            ) != pdTRUE
+        ) {
+            continue;
+        }
+
+        char text[
+            STT_TEXT_CAPACITY
+        ];
+
+        ESP_LOGI(
+            TAG,
+            "[STT] transcribing..."
+        );
+
+        esp_err_t error =
+            groq_stt_transcribe_pcm16(
+                job.samples,
+                job.sample_count,
+                job.sample_rate,
+                text,
+                sizeof(text)
+            );
+
+        if (error == ESP_OK) {
+
+            ESP_LOGI(
+                TAG,
+                "[STT] text: %s",
+                text
+            );
+
+
+            char answer[
+                CHAT_ANSWER_CAPACITY
+            ];
+
+
+            ESP_LOGI(
+                TAG,
+                "[LLM] thinking..."
+            );
+
+
+            esp_err_t chat_error =
+                groq_chat_ask(
+                    text,
+                    answer,
+                    sizeof(answer)
+                );
+
+
+            if (
+                chat_error ==
+                ESP_OK
+            ) {
+
+                ESP_LOGI(
+                    TAG,
+                    "[LLM] answer: %s",
+                    answer
+                );
+
+            } else {
+
+                ESP_LOGE(
+                    TAG,
+                    "[LLM] failed: %s",
+                    esp_err_to_name(
+                        chat_error
+                    )
+                );
+            }
+
+        } else {
+
+            ESP_LOGE(
+                TAG,
+                "[STT] failed: %s",
+                esp_err_to_name(error)
+            );
+        }
+
+        heap_caps_free(
+            job.samples
+        );
+
+        log_stack_high_water(
+            "groq_stt"
+        );
+    }
+}
 
 
 /*
@@ -455,6 +656,108 @@ static void wakenet_feed_task(void *arg)
             continue;
         }
 
+        /*
+         * The feed task remains the ONLY reader of the microphone.
+         *
+         * Recorder just taps the same PCM buffer and copies it to
+         * PSRAM. This avoids two consumers competing for INMP441/I2S.
+         */
+        if (
+            voice_recorder_is_recording()
+        ) {
+
+            esp_err_t recorder_error =
+                voice_recorder_push(
+                    audio_buffer,
+                    samples_read
+                );
+
+
+            /*
+             * ESP_ERR_NO_MEM here means the fixed-duration
+             * PSRAM buffer has become full. This is expected.
+             */
+            if (
+                recorder_error ==
+                ESP_ERR_NO_MEM
+            ) {
+
+                voice_recording_t recording;
+
+
+                if (
+                    voice_recorder_stop(
+                        &recording
+                    ) ==
+                    ESP_OK
+                ) {
+
+                    const uint32_t duration_ms =
+                        (uint32_t)(
+                            (
+                                (uint64_t)
+                                recording.sample_count *
+                                1000ULL
+                            ) /
+                            recording.sample_rate
+                        );
+
+
+                    ESP_LOGI(
+                        TAG,
+                        "[REC] ready: %u samples, %u ms, %u bytes",
+                        (unsigned int)
+                            recording.sample_count,
+                        (unsigned int)
+                            duration_ms,
+                        (unsigned int)(
+                            recording.sample_count *
+                            sizeof(int16_t)
+                        )
+                    );
+
+
+                    if (s_stt_enabled) {
+
+                        esp_err_t stt_error =
+                            queue_recording_for_stt(
+                                &recording
+                            );
+
+                        if (
+                            stt_error !=
+                            ESP_OK
+                        ) {
+
+                            ESP_LOGW(
+                                TAG,
+                                "Cannot queue STT job: %s",
+                                esp_err_to_name(
+                                    stt_error
+                                )
+                            );
+                        }
+                    }
+                }
+
+            } else if (
+                recorder_error !=
+                ESP_OK &&
+                recorder_error !=
+                ESP_ERR_INVALID_STATE
+            ) {
+
+                ESP_LOGW(
+                    TAG,
+                    "Recorder push failed: %s",
+                    esp_err_to_name(
+                        recorder_error
+                    )
+                );
+            }
+        }
+
+
         int result =
             s_afe_handle->feed(
                 s_afe_data,
@@ -628,6 +931,35 @@ static void wakenet_fetch_task(void *arg)
 
             command_session_started =
                 true;
+
+
+            esp_err_t recorder_error =
+                voice_recorder_start();
+
+
+            if (
+                recorder_error ==
+                ESP_OK
+            ) {
+
+                ESP_LOGI(
+                    TAG,
+                    "Recording user speech (%u ms max)",
+                    (unsigned int)
+                        RECORD_DURATION_MS
+                );
+
+            } else {
+
+                ESP_LOGW(
+                    TAG,
+                    "Cannot start recorder: %s",
+                    esp_err_to_name(
+                        recorder_error
+                    )
+                );
+            }
+
 
             ESP_LOGI(
                 TAG,
@@ -806,7 +1138,123 @@ esp_err_t app_voice_init(void)
     }
 
     /*
-     * 2. Speech models.
+     * 2. Recorder.
+     *
+     * 5 seconds x 16000 samples/s x 2 bytes
+     * = 160000 bytes in PSRAM.
+     */
+    error =
+        voice_recorder_init(
+            RECORD_DURATION_MS
+        );
+
+
+    if (error != ESP_OK) {
+
+        ESP_LOGE(
+            TAG,
+            "Voice recorder init failed: %s",
+            esp_err_to_name(error)
+        );
+
+        return error;
+    }
+
+
+    /*
+     * 3. Groq STT.
+     *
+     * Optional: local voice functions continue even
+     * when the key has not been configured.
+     */
+#if defined(CONFIG_GROQ_API_KEY)
+    if (
+        CONFIG_GROQ_API_KEY[0] != '\0'
+    ) {
+
+        error =
+            groq_stt_init(
+                CONFIG_GROQ_API_KEY
+            );
+
+
+        if (
+            error ==
+            ESP_OK
+        ) {
+
+            error =
+                groq_chat_init(
+                    CONFIG_GROQ_API_KEY
+                );
+        }
+
+
+        if (error == ESP_OK) {
+
+            s_stt_queue =
+                xQueueCreate(
+                    STT_QUEUE_LENGTH,
+                    sizeof(stt_job_t)
+                );
+
+            if (s_stt_queue == NULL) {
+                return ESP_ERR_NO_MEM;
+            }
+
+            BaseType_t stt_result =
+                xTaskCreate(
+                    stt_task,
+                    "groq_stt",
+                    STT_TASK_STACK_BYTES,
+                    NULL,
+                    STT_TASK_PRIORITY,
+                    NULL
+                );
+
+            if (
+                stt_result !=
+                pdPASS
+            ) {
+                vQueueDelete(
+                    s_stt_queue
+                );
+
+                s_stt_queue =
+                    NULL;
+
+                return ESP_ERR_NO_MEM;
+            }
+
+            s_stt_enabled =
+                true;
+
+            ESP_LOGI(
+                TAG,
+                "Groq STT ready"
+            );
+
+        } else {
+
+            ESP_LOGW(
+                TAG,
+                "Groq STT disabled: %s",
+                esp_err_to_name(error)
+            );
+        }
+
+    } else {
+
+        ESP_LOGW(
+            TAG,
+            "Groq API key is empty; STT disabled"
+        );
+    }
+#endif
+
+
+    /*
+     * 4. Speech models.
      */
     s_sr_models =
         esp_srmodel_init(
@@ -896,7 +1344,7 @@ esp_err_t app_voice_init(void)
     );
 
     /*
-     * 3. AFE interface.
+     * 4. AFE interface.
      */
     s_afe_handle =
         esp_afe_handle_from_config(
@@ -918,7 +1366,7 @@ esp_err_t app_voice_init(void)
     }
 
     /*
-     * 4. AFE runtime.
+     * 5. AFE runtime.
      */
     s_afe_data =
         s_afe_handle->
@@ -945,7 +1393,7 @@ esp_err_t app_voice_init(void)
     );
 
     /*
-     * 5. MultiNet.
+     * 6. MultiNet.
      */
     error =
         multinet_init();
@@ -982,7 +1430,7 @@ esp_err_t app_voice_init(void)
     );
 
     /*
-     * 6. Hello AVI task.
+     * 7. Hello AVI task.
      */
     BaseType_t task_result =
         xTaskCreate(
@@ -1005,7 +1453,7 @@ esp_err_t app_voice_init(void)
     }
 
     /*
-     * 7. Feed task.
+     * 8. Feed task.
      */
     task_result =
         xTaskCreate(
@@ -1028,7 +1476,7 @@ esp_err_t app_voice_init(void)
     }
 
     /*
-     * 8. Fetch task.
+     * 9. Fetch task.
      */
     task_result =
         xTaskCreate(

@@ -1,0 +1,13 @@
+menu "Groq"
+
+    config GROQ_API_KEY
+        string "Groq API key"
+        default ""
+        help
+            API key used by the ESP32 Groq client.
+
+            Do not share this key publicly.
+            Do not commit a configured sdkconfig containing
+            a real API key to a public repository.
+
+endmenu

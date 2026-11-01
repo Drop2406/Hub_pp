@@ -18,10 +18,98 @@ static esp_event_handler_instance_t s_ip_handler;
 static bool s_started = false;
 static bool s_stopping = false;
 
-static void wifi_event_handler(void *arg,
-                               esp_event_base_t event_base,
-                               int32_t event_id,
-                               void *event_data)
+
+static const char *wifi_second_channel_name(
+    wifi_second_chan_t second
+)
+{
+    switch (second) {
+    case WIFI_SECOND_CHAN_NONE:
+        return "NONE";
+
+    case WIFI_SECOND_CHAN_ABOVE:
+        return "ABOVE";
+
+    case WIFI_SECOND_CHAN_BELOW:
+        return "BELOW";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+
+
+static void wifi_log_link_info(void)
+{
+    wifi_ap_record_t ap_info = {0};
+
+    esp_err_t err =
+        esp_wifi_sta_get_ap_info(
+            &ap_info
+        );
+
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "[LINK] esp_wifi_sta_get_ap_info failed: %s",
+            esp_err_to_name(err)
+        );
+        return;
+    }
+
+    wifi_ps_type_t ps_mode =
+        WIFI_PS_MIN_MODEM;
+
+    esp_err_t ps_err =
+        esp_wifi_get_ps(
+            &ps_mode
+        );
+
+    ESP_LOGI(
+        TAG,
+        "[LINK] SSID=%s RSSI=%d dBm channel=%u second=%s",
+        (const char *)ap_info.ssid,
+        (int)ap_info.rssi,
+        (unsigned int)ap_info.primary,
+        wifi_second_channel_name(
+            ap_info.second
+        )
+    );
+
+    ESP_LOGI(
+        TAG,
+        "[LINK] PHY: 11b=%u 11g=%u 11n=%u LR=%u",
+        (unsigned int)ap_info.phy_11b,
+        (unsigned int)ap_info.phy_11g,
+        (unsigned int)ap_info.phy_11n,
+        (unsigned int)ap_info.phy_lr
+    );
+
+    if (ps_err == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "[LINK] Wi-Fi power save mode=%d%s",
+            (int)ps_mode,
+            (ps_mode == WIFI_PS_NONE)
+                ? " (NONE)"
+                : ""
+        );
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[LINK] esp_wifi_get_ps failed: %s",
+            esp_err_to_name(ps_err)
+        );
+    }
+}
+
+
+static void wifi_event_handler(
+    void *arg,
+    esp_event_base_t event_base,
+    int32_t event_id,
+    void *event_data
+)
 {
     (void)arg;
 
@@ -31,12 +119,19 @@ static void wifi_event_handler(void *arg,
 
     switch (event_id) {
     case WIFI_EVENT_STA_START:
-        ESP_LOGI(TAG, "Wi-Fi STA started");
+        ESP_LOGI(
+            TAG,
+            "Wi-Fi STA started"
+        );
+
         esp_wifi_connect();
         break;
 
     case WIFI_EVENT_STA_CONNECTED:
-        ESP_LOGI(TAG, "Wi-Fi connected");
+        ESP_LOGI(
+            TAG,
+            "Wi-Fi connected"
+        );
 
         if (s_wifi_events) {
             xEventGroupSetBits(
@@ -50,9 +145,11 @@ static void wifi_event_handler(void *arg,
         wifi_event_sta_disconnected_t *disconnected =
             (wifi_event_sta_disconnected_t *)event_data;
 
-        ESP_LOGW(TAG,
-                 "Wi-Fi disconnected, reason=%d",
-                 disconnected->reason);
+        ESP_LOGW(
+            TAG,
+            "Wi-Fi disconnected, reason=%d",
+            disconnected->reason
+        );
 
         if (s_wifi_events) {
             xEventGroupClearBits(
@@ -64,12 +161,15 @@ static void wifi_event_handler(void *arg,
 
 #if CONFIG_WIFI_STA_AUTO_RECONNECT
         if (!s_stopping) {
-            esp_err_t err = esp_wifi_connect();
+            esp_err_t err =
+                esp_wifi_connect();
 
             if (err != ESP_OK) {
-                ESP_LOGW(TAG,
-                         "Reconnect failed: %s",
-                         esp_err_to_name(err));
+                ESP_LOGW(
+                    TAG,
+                    "Reconnect failed: %s",
+                    esp_err_to_name(err)
+                );
             }
         }
 #endif
@@ -81,18 +181,25 @@ static void wifi_event_handler(void *arg,
     }
 }
 
-static void ip_event_handler(void *arg,
-                             esp_event_base_t event_base,
-                             int32_t event_id,
-                             void *event_data)
+
+static void ip_event_handler(
+    void *arg,
+    esp_event_base_t event_base,
+    int32_t event_id,
+    void *event_data
+)
 {
     (void)arg;
     (void)event_data;
 
-    if (event_base == IP_EVENT &&
-        event_id == IP_EVENT_STA_GOT_IP) {
-
-        ESP_LOGI(TAG, "IPv4 address obtained");
+    if (
+        event_base == IP_EVENT &&
+        event_id == IP_EVENT_STA_GOT_IP
+    ) {
+        ESP_LOGI(
+            TAG,
+            "IPv4 address obtained"
+        );
 
         if (s_wifi_events) {
             xEventGroupSetBits(
@@ -100,13 +207,27 @@ static void ip_event_handler(void *arg,
                 WIFI_STA_IPV4_OBTAINED_BIT
             );
         }
+
+        /*
+         * Diagnostic only:
+         * log RSSI / channel / supported PHY after STA
+         * is fully associated and has obtained IPv4.
+         */
+        wifi_log_link_info();
     }
 }
 
-esp_err_t wifi_sta_init(EventGroupHandle_t event_group)
+
+esp_err_t wifi_sta_init(
+    EventGroupHandle_t event_group
+)
 {
 #if !CONFIG_WIFI_STA_CONNECT
-    ESP_LOGI(TAG, "Wi-Fi disabled by menuconfig");
+    ESP_LOGI(
+        TAG,
+        "Wi-Fi disabled by menuconfig"
+    );
+
     return ESP_OK;
 #else
 
@@ -114,50 +235,70 @@ esp_err_t wifi_sta_init(EventGroupHandle_t event_group)
         return ESP_OK;
     }
 
-    s_wifi_events = event_group;
-    s_stopping = false;
+    s_wifi_events =
+        event_group;
 
-    s_sta_netif = esp_netif_create_default_wifi_sta();
+    s_stopping =
+        false;
+
+    s_sta_netif =
+        esp_netif_create_default_wifi_sta();
 
     if (s_sta_netif == NULL) {
-        ESP_LOGE(TAG, "Failed to create default Wi-Fi STA netif");
+        ESP_LOGE(
+            TAG,
+            "Failed to create default Wi-Fi STA netif"
+        );
+
         return ESP_FAIL;
     }
 
-    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    wifi_init_config_t init_cfg =
+        WIFI_INIT_CONFIG_DEFAULT();
 
-    esp_err_t err = esp_wifi_init(&init_cfg);
+    esp_err_t err =
+        esp_wifi_init(
+            &init_cfg
+        );
 
     if (err != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "esp_wifi_init failed: %s",
-                 esp_err_to_name(err));
+        ESP_LOGE(
+            TAG,
+            "esp_wifi_init failed: %s",
+            esp_err_to_name(err)
+        );
 
-        esp_netif_destroy_default_wifi(s_sta_netif);
-        s_sta_netif = NULL;
+        esp_netif_destroy_default_wifi(
+            s_sta_netif
+        );
+
+        s_sta_netif =
+            NULL;
 
         return err;
     }
 
-    err = esp_event_handler_instance_register(
-        WIFI_EVENT,
-        ESP_EVENT_ANY_ID,
-        &wifi_event_handler,
-        NULL,
-        &s_wifi_handler
-    );
+    err =
+        esp_event_handler_instance_register(
+            WIFI_EVENT,
+            ESP_EVENT_ANY_ID,
+            &wifi_event_handler,
+            NULL,
+            &s_wifi_handler
+        );
 
     if (err != ESP_OK) {
         goto fail;
     }
 
-    err = esp_event_handler_instance_register(
-        IP_EVENT,
-        IP_EVENT_STA_GOT_IP,
-        &ip_event_handler,
-        NULL,
-        &s_ip_handler
-    );
+    err =
+        esp_event_handler_instance_register(
+            IP_EVENT,
+            IP_EVENT_STA_GOT_IP,
+            &ip_event_handler,
+            NULL,
+            &s_ip_handler
+        );
 
     if (err != ESP_OK) {
         esp_event_handler_instance_unregister(
@@ -171,43 +312,78 @@ esp_err_t wifi_sta_init(EventGroupHandle_t event_group)
 
     wifi_config_t wifi_config = {0};
 
-    strncpy((char *)wifi_config.sta.ssid,
-            CONFIG_WIFI_STA_SSID,
-            sizeof(wifi_config.sta.ssid) - 1);
+    strncpy(
+        (char *)wifi_config.sta.ssid,
+        CONFIG_WIFI_STA_SSID,
+        sizeof(wifi_config.sta.ssid) - 1
+    );
 
-    strncpy((char *)wifi_config.sta.password,
-            CONFIG_WIFI_STA_PASSWORD,
-            sizeof(wifi_config.sta.password) - 1);
+    strncpy(
+        (char *)wifi_config.sta.password,
+        CONFIG_WIFI_STA_PASSWORD,
+        sizeof(wifi_config.sta.password) - 1
+    );
 
     wifi_config.sta.threshold.authmode =
         WIFI_AUTH_WPA2_PSK;
 
-    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    err =
+        esp_wifi_set_mode(
+            WIFI_MODE_STA
+        );
 
     if (err != ESP_OK) {
         goto fail_handlers;
     }
 
-    err = esp_wifi_set_config(
-        WIFI_IF_STA,
-        &wifi_config
+    err =
+        esp_wifi_set_config(
+            WIFI_IF_STA,
+            &wifi_config
+        );
+
+    if (err != ESP_OK) {
+        goto fail_handlers;
+    }
+
+    err =
+        esp_wifi_start();
+
+    if (err != ESP_OK) {
+        goto fail_handlers;
+    }
+
+    /*
+     * Keep Wi-Fi fully awake for long HTTPS/TLS uploads.
+     */
+    err =
+        esp_wifi_set_ps(
+            WIFI_PS_NONE
+        );
+
+    if (err != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Cannot disable Wi-Fi power save: %s",
+            esp_err_to_name(err)
+        );
+    } else {
+        ESP_LOGI(
+            TAG,
+            "Wi-Fi power save disabled"
+        );
+    }
+
+    s_started =
+        true;
+
+    ESP_LOGI(
+        TAG,
+        "Wi-Fi initialized"
     );
 
-    if (err != ESP_OK) {
-        goto fail_handlers;
-    }
-
-    err = esp_wifi_start();
-
-    if (err != ESP_OK) {
-        goto fail_handlers;
-    }
-
-    s_started = true;
-
-    ESP_LOGI(TAG, "Wi-Fi initialized");
-
     return ESP_OK;
+
 
 fail_handlers:
 
@@ -223,19 +399,25 @@ fail_handlers:
         s_wifi_handler
     );
 
+
 fail:
 
     esp_wifi_deinit();
 
     if (s_sta_netif) {
-        esp_netif_destroy_default_wifi(s_sta_netif);
-        s_sta_netif = NULL;
+        esp_netif_destroy_default_wifi(
+            s_sta_netif
+        );
+
+        s_sta_netif =
+            NULL;
     }
 
     return err;
 
 #endif
 }
+
 
 esp_err_t wifi_sta_stop(void)
 {
@@ -247,7 +429,8 @@ esp_err_t wifi_sta_stop(void)
         return ESP_OK;
     }
 
-    s_stopping = true;
+    s_stopping =
+        true;
 
     if (s_wifi_events) {
         xEventGroupClearBits(
@@ -275,12 +458,19 @@ esp_err_t wifi_sta_stop(void)
     esp_wifi_deinit();
 
     if (s_sta_netif) {
-        esp_netif_destroy_default_wifi(s_sta_netif);
-        s_sta_netif = NULL;
+        esp_netif_destroy_default_wifi(
+            s_sta_netif
+        );
+
+        s_sta_netif =
+            NULL;
     }
 
-    s_started = false;
-    s_wifi_events = NULL;
+    s_started =
+        false;
+
+    s_wifi_events =
+        NULL;
 
     return ESP_OK;
 
