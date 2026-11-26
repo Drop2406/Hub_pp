@@ -41,6 +41,7 @@
 
 #define HELLO_RETRIGGER_GUARD_MS 1500U
 #define COMMAND_LISTEN_WINDOW_MS 8000U
+#define TTS_AUDIO_DRAIN_GUARD_MS  600U
 
 #define COMMAND_LED_ON  1
 #define COMMAND_LED_OFF 2
@@ -90,6 +91,7 @@ static QueueHandle_t s_stt_queue = NULL;
 static bool s_stt_enabled = false;
 static bool s_tts_enabled = false;
 static atomic_bool s_tts_playing = ATOMIC_VAR_INIT(false);
+static atomic_bool s_cloud_job_active = ATOMIC_VAR_INIT(false);
 
 static void log_stack_high_water(
     const char *task_name
@@ -142,6 +144,16 @@ static esp_err_t queue_recording_for_stt(
         .sample_rate = recording->sample_rate,
     };
 
+    /*
+     * Reserve the conversation before publishing its STT job.
+     * WakeNet must not start a new cloud request while this one runs.
+     */
+    if (atomic_exchange(&s_cloud_job_active, true)) {
+        heap_caps_free(copy);
+        ESP_LOGW(TAG, "[SESSION] Cloud job busy; recording rejected");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (
         xQueueSend(
             s_stt_queue,
@@ -149,6 +161,7 @@ static esp_err_t queue_recording_for_stt(
             0
         ) != pdTRUE
     ) {
+        atomic_store(&s_cloud_job_active, false);
         heap_caps_free(copy);
         return ESP_ERR_TIMEOUT;
     }
@@ -261,6 +274,20 @@ static void stt_task(void *arg)
                         );
 
 
+                    /*
+                     * groq_tts_speak() returns when all PCM has been
+                     * enqueued, not necessarily after the final sample
+                     * has left I2S. Current audio buffer is 8 KiB:
+                     * ~256 ms @ 16 kHz mono16, plus DMA in flight.
+                     * Hold the microphone suppression a bit longer.
+                     * This is a conservative guard, not a precise
+                     * playback-drained signal.
+                     */
+                    vTaskDelay(
+                        pdMS_TO_TICKS(TTS_AUDIO_DRAIN_GUARD_MS)
+                    );
+
+
                     atomic_store(
                         &s_tts_playing,
                         false
@@ -316,6 +343,10 @@ static void stt_task(void *arg)
         log_stack_high_water(
             "groq_stt"
         );
+
+        /* Release the whole cloud session on every success/error path. */
+        atomic_store(&s_cloud_job_active, false);
+        ESP_LOGI(TAG, "[SESSION] Cloud job complete; ready for wake");
     }
 }
 
@@ -918,10 +949,22 @@ static void wakenet_fetch_task(void *arg)
                 &s_tts_playing
             )
         ) {
+            /*
+             * Do not reset command_session_started here: it would
+             * accidentally start the recorder again after TTS.
+             * Leave the original command deadline intact.
+             */
+            continue;
+        }
 
-            command_session_started =
-                false;
-
+        /*
+         * While the cloud job runs, ignore WakeNet hits in WAIT_WAKE.
+         * In LISTEN_COMMAND, keep the existing MultiNet time window.
+         */
+        if (
+            state == VOICE_WAIT_WAKE &&
+            atomic_load(&s_cloud_job_active)
+        ) {
             continue;
         }
 
