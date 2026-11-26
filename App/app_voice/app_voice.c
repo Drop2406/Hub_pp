@@ -25,6 +25,7 @@
 #include "voice_recorder.h"
 #include "groq_stt.h"
 #include "groq_chat.h"
+#include "groq_tts.h"
 
 #include "model_path.h"
 #include "esp_afe_config.h"
@@ -87,6 +88,8 @@ typedef struct {
 
 static QueueHandle_t s_stt_queue = NULL;
 static bool s_stt_enabled = false;
+static bool s_tts_enabled = false;
+static atomic_bool s_tts_playing = ATOMIC_VAR_INIT(false);
 
 static void log_stack_high_water(
     const char *task_name
@@ -234,6 +237,57 @@ static void stt_task(void *arg)
                     "[LLM] answer: %s",
                     answer
                 );
+
+
+                if (
+                    s_tts_enabled
+                ) {
+
+                    ESP_LOGI(
+                        TAG,
+                        "[TTS] speaking..."
+                    );
+
+
+                    atomic_store(
+                        &s_tts_playing,
+                        true
+                    );
+
+
+                    esp_err_t tts_error =
+                        groq_tts_speak(
+                            answer
+                        );
+
+
+                    atomic_store(
+                        &s_tts_playing,
+                        false
+                    );
+
+
+                    if (
+                        tts_error ==
+                        ESP_OK
+                    ) {
+
+                        ESP_LOGI(
+                            TAG,
+                            "[TTS] done"
+                        );
+
+                    } else {
+
+                        ESP_LOGE(
+                            TAG,
+                            "[TTS] failed: %s",
+                            esp_err_to_name(
+                                tts_error
+                            )
+                        );
+                    }
+                }
 
             } else {
 
@@ -852,6 +906,25 @@ static void wakenet_fetch_task(void *arg)
                 &s_voice_state
             );
 
+
+        /*
+         * Speaker TTS can be picked up by the microphone.
+         *
+         * Keep draining AFE, but ignore WakeNet/MultiNet
+         * decisions until TTS playback has finished.
+         */
+        if (
+            atomic_load(
+                &s_tts_playing
+            )
+        ) {
+
+            command_session_started =
+                false;
+
+            continue;
+        }
+
         /*
          * WAIT_WAKE
          */
@@ -1187,6 +1260,38 @@ esp_err_t app_voice_init(void)
                 groq_chat_init(
                     CONFIG_GROQ_API_KEY
                 );
+        }
+
+
+        if (
+            error ==
+            ESP_OK
+        ) {
+
+            esp_err_t tts_error =
+                groq_tts_init(
+                    CONFIG_GROQ_API_KEY
+                );
+
+
+            if (
+                tts_error ==
+                ESP_OK
+            ) {
+
+                s_tts_enabled =
+                    true;
+
+            } else {
+
+                ESP_LOGW(
+                    TAG,
+                    "Groq TTS disabled: %s",
+                    esp_err_to_name(
+                        tts_error
+                    )
+                );
+            }
         }
 
 
